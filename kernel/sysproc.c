@@ -110,3 +110,34 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// turn on logging; returns the new value of the logging flag.
+uint64
+sys_startLogging(void)
+{
+  logging_enabled = 1;
+  printk("Logging Started\n");
+  return logging_enabled;
+}
+
+// turn off logging; returns the new value of the logging flag.
+uint64
+sys_stopLogging(void)
+{
+  printk("Logging Stopped\n");
+  logging_enabled = 0;
+  return logging_enabled;
+}
+
+// add inc to the nice value of process pid;
+// returns the new nice value, or 0 if pid is invalid.
+uint64
+sys_nice(void)
+{
+  int pid;
+  int inc;
+
+  argint(0, &pid);
+  argint(1, &inc);
+  return setnice(pid, inc);
+}

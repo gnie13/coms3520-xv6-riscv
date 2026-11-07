@@ -15,6 +15,9 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+// 1 while logging is turned on by startLogging(), 0 otherwise.
+int logging_enabled = 0;
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -123,6 +126,7 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->nice = 0;
   p->state = USED;
 
   // Allocate a trapframe page.
@@ -163,6 +167,7 @@ freeproc(struct proc *p)
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
+  p->nice = 0;
   p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
@@ -430,6 +435,7 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+  int last = NPROC - 1; // slot of the last process this CPU ran
 
   c->proc = 0;
   for (;;) {
@@ -441,15 +447,37 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
+    // Pass 1: find the lowest nice value among RUNNABLE processes.
+    int best = 20; // above the highest legal nice value (19)
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if (p->state == RUNNABLE) {
+      if (p->state == RUNNABLE && p->nice < best)
+        best = p->nice;
+      release(&p->lock);
+    }
+
+    if (best == 20) {
+      // nothing to run; stop running on this core until an interrupt.
+      asm volatile("wfi");
+      continue;
+    }
+
+    // Pass 2: run the next RUNNABLE process at that nice value,
+    // starting after the last one run, so equal-nice processes
+    // take turns.
+    for (int i = 1; i <= NPROC; i++) {
+      p = &proc[(last + i) % NPROC];
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && p->nice == best) {
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        // ticks is read without tickslock: taking it while holding
+        // p->lock would reverse clockintr()'s lock order.
+        if (logging_enabled)
+          printk("running %d at %d\n", p->pid, ticks);
         swtch(&c->context, &p->context);
 
         // Don't re-enable interrupts on release.
@@ -458,13 +486,11 @@ scheduler(void)
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
-        found = 1;
+        last = p - proc;
+        release(&p->lock);
+        break; // rescan so a newly RUNNABLE lower-nice process wins
       }
       release(&p->lock);
-    }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
     }
   }
 }
@@ -617,6 +643,41 @@ kkill(int pid)
     release(&p->lock);
   }
   return -1;
+}
+
+// Add inc to the nice value of the process with the given pid,
+// clamped to [-20, 19]. Returns the new nice value, or 0 if
+// no live process has that pid.
+int
+setnice(int pid, int inc)
+{
+  struct proc *p;
+  int n;
+
+  // Limit inc first so p->nice + inc cannot overflow.
+  if (inc > 39)
+    inc = 39;
+  if (inc < -39)
+    inc = -39;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    // UNUSED slots all have pid 0, so they must not match.
+    if (p->state != UNUSED && p->pid == pid) {
+      n = p->nice + inc;
+      if (n > 19)
+        n = 19;
+      if (n < -20)
+        n = -20;
+      p->nice = n;
+      release(&p->lock);
+      if (logging_enabled)
+        printk("nice set to %d for %d\n", n, pid);
+      return n;
+    }
+    release(&p->lock);
+  }
+  return 0;
 }
 
 void
