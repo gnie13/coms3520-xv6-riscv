@@ -9,6 +9,9 @@
 // set_scheduler(id) system call (for example: wl 2 1). To try a
 // different setting, such as another quantum, give it its own ID.
 //
+// Scheduler IDs added for Project 1C (Feature 7):
+//   6  SCHED_RR5   round robin with a 5-tick (50 ms) quantum
+//
 // Rules for policy code (Section 2.2 of the project document):
 //  1. The system has one CPU. These functions run with interrupts off
 //     and must not sleep or acquire p->lock (the framework holds the
@@ -38,6 +41,7 @@
 #define SCHED_RR     0 // round robin, 10-tick (100 ms) quantum: stock xv6
 #define SCHED_RR1    1 // round robin, 1-tick (10 ms) quantum
 #define SCHED_PRIO   2 // strict priority by nice (Project 1B), 10-tick quantum
+#define SCHED_RR5    6 // round robin, 5-tick (50 ms) quantum
 
 // Linux CFS weights for nice -20 .. 19, indexed by nice + 20
 // (nice 0 has weight 1024). This is the same table user/wl.c uses
@@ -67,6 +71,9 @@ policy_init(int id)
     break;
   case SCHED_RR1:
     quantum = 1;
+    break;
+  case SCHED_RR5:
+    quantum = 5;
     break;
   default:
     return -1;
