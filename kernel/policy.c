@@ -14,6 +14,8 @@
 //                  allotment kept across sleeps, boost every 60 ticks
 //   4  SCHED_STRIDE stride scheduling (Section 3.6): pass in vrt, stride from
 //                  the nice weight, 5-tick slice, wakeup clamp to the min pass
+//   5  SCHED_STRIDE_LAT  own design: stride (ID 4) with a CFS-style targeted
+//                  latency (OSTEP 9.7): slice = max(2, 10 / runnable jobs)
 //   6  SCHED_RR5   round robin with a 5-tick (50 ms) quantum
 //  10  SCHED_STRIDE_S1     stride (ID 4) with a 1-tick slice
 //  11  SCHED_STRIDE_WAKE   stride (ID 4) + a waking job with a lower pass
@@ -52,6 +54,7 @@
 #define SCHED_PRIO   2 // strict priority by nice (Project 1B), 10-tick quantum
 #define SCHED_MLFQ   3 // multi-level feedback queue, 1C rules
 #define SCHED_STRIDE 4 // stride scheduling, 5-tick slice
+#define SCHED_STRIDE_LAT 5 // own design: stride + targeted latency
 #define SCHED_RR5    6 // round robin, 5-tick (50 ms) quantum
 #define SCHED_STRIDE_S1    10 // stride, 1-tick slice (H1)
 #define SCHED_STRIDE_WAKE  11 // stride, preempt on wakeup (H2)
@@ -96,6 +99,9 @@ static int stride_wake_preempt; // 1: a waking job with a lower pass than
                                 // the running job preempts it (ID 11)
 static int need_resched;    // set by policy_wakeup(), used by policy_tick()
 static int stride_min_weight;   // weight floor in stride_of(); 0 = none
+static int stride_target_latency; // ID 5: ticks in which every runnable job
+                                  // should run once; 0 = fixed stride_slice
+static int stride_min_gran;       // ID 5: smallest slice, in ticks
 
 // Called by set_scheduler(id), and again when a workload starts.
 // Set up global state for policy id. Every call resets all of the
@@ -111,6 +117,8 @@ policy_init(int id)
   stride_slice = 5;
   stride_wake_preempt = 0;
   stride_min_weight = 0;
+  stride_target_latency = 0;
+  stride_min_gran = 2;
   switch (id) {
   case SCHED_RR:
   case SCHED_PRIO:
@@ -154,6 +162,18 @@ policy_init(int id)
     stride_on = 1;
     stride_slice = 5;
     stride_min_weight = 1024;
+    break;
+  case SCHED_STRIDE_LAT:
+    // Own design. Both values were fixed by principle before any run:
+    //  - min_gran 2 ticks: a switch costs SWITCH_COST / TICK_UNITS =
+    //    0.2 tick, so a slice of at least 2 ticks keeps switch
+    //    overhead at or below 10% (OSTEP Ch. 7's amortization example).
+    //  - target_latency 10 ticks (100 ms): the ~0.1 s limit for a
+    //    response to feel instant (Card, Moran & Newell 1983; Nielsen
+    //    1993); also stock xv6's quantum, so a job alone acts as ID 0.
+    stride_on = 1;
+    stride_target_latency = 10;
+    stride_min_gran = 2;
     break;
   default:
     return -1;
@@ -229,6 +249,29 @@ stride_of(struct proc *p)
   if (w < stride_min_weight)
     w = stride_min_weight;
   return (1 << 24) / w;
+}
+
+// Stride slice length in ticks. With a target latency (ID 5), this is
+// CFS's targeted latency from OSTEP 9.7: share target_latency among
+// the n RUNNING + RUNNABLE processes (n >= 1: the caller is running),
+// rounded down so n slices fit in the target, but never below
+// min_gran. Counts every process alike (policy-code rule 4).
+// Recomputed on every tick, like CFS's check_preempt_tick(), so a
+// wakeup shortens the running job's slice at that tick.
+static int
+stride_cur_slice(void)
+{
+  int n = 0, s;
+
+  if (stride_target_latency == 0)
+    return stride_slice;
+  for (struct proc *q = proc; q < &proc[NPROC]; q++)
+    if (q->state == RUNNING || q->state == RUNNABLE)
+      n++;
+  if (n < 1)
+    n = 1;
+  s = stride_target_latency / n;
+  return s < stride_min_gran ? stride_min_gran : s;
 }
 
 // Round robin: the next RUNNABLE process after the last one chosen,
@@ -375,7 +418,7 @@ policy_tick(struct proc *p)
   if (stride_on) {
     // Charge this tick at p's current weight; re-pick after a slice.
     // Without stride_wake_preempt, a lower-pass job that wakes waits
-    // for the end of the current slice (at most stride_slice ticks).
+    // for the end of the current slice (at most stride_cur_slice()).
     p->vrt += stride_of(p);
     p->qticks++;
     // ID 11: a job woke this tick with a lower pass (clockintr() runs
@@ -384,7 +427,7 @@ policy_tick(struct proc *p)
       need_resched = 0;
       return 1;
     }
-    return p->qticks >= stride_slice;
+    return p->qticks >= stride_cur_slice();
   }
   if (!mlfq_on) {
     p->qticks++;

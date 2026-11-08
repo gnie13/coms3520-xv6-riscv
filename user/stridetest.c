@@ -1,8 +1,13 @@
-// Project 1C: rule checks for stride scheduling, scheduler 4.
+// Project 1C: rule checks for stride scheduling.
 //
-//   stridetest
+//   stridetest [scheduler-id]
 //
-// Three parts, each started with set_scheduler(4), which sets every
+// The scheduler ID defaults to 4; use 5 for the own design (stride
+// with targeted latency), which keeps ID 4's pass, wakeup and fork
+// rules. In every part only two processes compete, so ID 5's slice is
+// max(2, 10 / 2) = 5 ticks, the same as ID 4, and the limits below hold.
+//
+// Three parts, each started with set_scheduler(id), which sets every
 // pass and the global pass back to 0. Each part runs a CPU-bound
 // helper H next to a test child and prints a number with PASS/FAIL.
 // Every other process (init, sh, the parent) is asleep, so H and the
@@ -66,11 +71,13 @@ start(void (*fn)(void))
   return pid;
 }
 
+static int sched_id = 4;
+
 static void
 reset(void)
 {
-  if (set_scheduler(4) < 0) {
-    printf("stridetest: set_scheduler(4) failed\n");
+  if (set_scheduler(sched_id) < 0) {
+    printf("stridetest: set_scheduler(%d) failed\n", sched_id);
     exit(1);
   }
 }
@@ -117,8 +124,16 @@ forked(void)
 }
 
 int
-main(void)
+main(int argc, char *argv[])
 {
+  if (argc > 2) {
+    printf("usage: stridetest [scheduler-id]\n");
+    exit(1);
+  }
+  if (argc == 2)
+    sched_id = atoi(argv[1]);
+  printf("stridetest: scheduler %d\n", sched_id);
+
   reset();
   start(h70);
   start(sleeper);
@@ -138,6 +153,6 @@ main(void)
   wait(0);
   wait(0);
 
-  printf("stridetest: done (scheduler 4 is still selected)\n");
+  printf("stridetest: done (scheduler %d is still selected)\n", sched_id);
   exit(0);
 }
