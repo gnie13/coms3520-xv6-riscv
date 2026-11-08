@@ -10,6 +10,8 @@
 // different setting, such as another quantum, give it its own ID.
 //
 // Scheduler IDs added for Project 1C (Feature 7):
+//   3  SCHED_MLFQ  MLFQ, 1C rules (Section 3.5): 3 queues, start queue by nice,
+//                  allotment kept across sleeps, boost every 60 ticks
 //   6  SCHED_RR5   round robin with a 5-tick (50 ms) quantum
 //
 // Rules for policy code (Section 2.2 of the project document):
@@ -41,6 +43,7 @@
 #define SCHED_RR     0 // round robin, 10-tick (100 ms) quantum: stock xv6
 #define SCHED_RR1    1 // round robin, 1-tick (10 ms) quantum
 #define SCHED_PRIO   2 // strict priority by nice (Project 1B), 10-tick quantum
+#define SCHED_MLFQ   3 // multi-level feedback queue, 1C rules
 #define SCHED_RR5    6 // round robin, 5-tick (50 ms) quantum
 
 // Linux CFS weights for nice -20 .. 19, indexed by nice + 20
@@ -58,12 +61,26 @@ const int nice_weight[40] = {
 static int quantum = 10; // ticks a process may run before preemption
 static int last = -1;    // index in proc[] of the last process chosen
 
+// ---- MLFQ state (ID 3, and later MLFQ tuning variants) ----
+// Queue levels: 2 = Q2 (highest), 1 = Q1, 0 = Q0 (lowest).
+// The settings are globals set in policy_init(), so a tuning variant
+// is just another case there with different numbers.
+#define MLFQ_LEVELS 3
+static int mlfq_on;                    // 1 while an MLFQ policy is selected
+static int mlfq_quantum[MLFQ_LEVELS];  // quantum per level, in ticks
+static int mlfq_allot[MLFQ_LEVELS];    // allotment per level (Q0: unused)
+static int boost_interval;             // ticks between priority boosts
+static uint last_boost;                // value of ticks at the last boost
+static int last_at[MLFQ_LEVELS];       // round-robin index per level
+
 // Called by set_scheduler(id), and again when a workload starts.
-// Set up global state for policy id.
+// Set up global state for policy id. Every call resets all of the
+// policy's global state, so every run starts the same way.
 // Return 0 if id is a known policy, -1 otherwise.
 int
 policy_init(int id)
 {
+  mlfq_on = 0;
   switch (id) {
   case SCHED_RR:
   case SCHED_PRIO:
@@ -75,11 +92,48 @@ policy_init(int id)
   case SCHED_RR5:
     quantum = 5;
     break;
+  case SCHED_MLFQ:
+    // Queue table, Section 3.5.
+    mlfq_on = 1;
+    mlfq_quantum[2] = 2;  mlfq_allot[2] = 2;
+    mlfq_quantum[1] = 10; mlfq_allot[1] = 10;
+    mlfq_quantum[0] = 15; mlfq_allot[0] = 0; // Q0: no further demotion
+    boost_interval = 60;
+    break;
   default:
     return -1;
   }
   last = -1;
+  // Rule 5: the boost clock starts now, not at tick 0, so the first
+  // boost comes boost_interval ticks after the scheduler is selected
+  // or the workload starts.
+  last_boost = ticks;
+  for (int i = 0; i < MLFQ_LEVELS; i++)
+    last_at[i] = -1;
   return 0;
+}
+
+// MLFQ Rule 3: the starting queue for a nice value (Section 3.5 table).
+static int
+start_level(int nice)
+{
+  if (nice <= -10)
+    return 2;
+  if (nice <= 10)
+    return 1;
+  return 0;
+}
+
+// Move p to queue level nl. Every queue change (demotion, boost, nice)
+// goes through here, so each one is logged the same way, but only
+// while logging is on and only if the level actually changes.
+// Does not touch p->used or p->qticks; callers decide that.
+static void
+set_level(struct proc *p, int nl)
+{
+  if (nl != p->level && logging)
+    printk("level %d %d->%d at %d\n", p->pid, p->level, nl, ticks);
+  p->level = nl;
 }
 
 // Called when a process is created, and for every process when the
@@ -89,10 +143,11 @@ void
 policy_proc_init(struct proc *p)
 {
   p->qticks = 0;
-  // Level 0 is the lowest queue (Q0); Q2 is the highest. An MLFQ must
-  // set the starting level from p->nice here: workload_start() calls
-  // this for every process after the jobs' nice values are set.
-  p->level = 0;
+  // MLFQ Rule 3: start in the queue chosen by nice. workload_start()
+  // calls this for every process after the jobs' nice values are set.
+  // Other policies ignore start and level.
+  p->start = start_level(p->nice);
+  p->level = p->start;
   p->used = 0;
   p->vrt = 0;
 }
@@ -132,10 +187,61 @@ pick_prio(void)
   return 0;
 }
 
+// MLFQ Rule 5: priority boost. Once boost_interval ticks have passed
+// since the last boost, move every process to its starting queue or
+// Q1, whichever is higher, and reset its used time even if its queue
+// does not change. Called from both policy_tick() and
+// policy_pick_next_proc(), so the boost is on time even when every
+// process is asleep. Writes other processes' fields without p->lock:
+// one CPU, interrupts off (policy-code rule 1).
+static void
+maybe_boost(void)
+{
+  if (ticks - last_boost < boost_interval)
+    return;
+  if (logging)
+    printk("boost at %d\n", ticks);
+  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
+    if (p->state == UNUSED)
+      continue;
+    set_level(p, p->start > 1 ? p->start : 1);
+    p->used = 0;
+  }
+  last_boost = ticks;
+}
+
+// MLFQ selection. Rule 1: only the highest level that has a RUNNABLE
+// process is considered. Rule 2: round robin within that level, with
+// its own last index, so a higher-level job running in between does
+// not move the scan position of a lower level (no starvation within
+// a level).
+static struct proc *
+pick_mlfq(void)
+{
+  int top = -1;
+
+  maybe_boost();
+  for (struct proc *p = proc; p < &proc[NPROC]; p++)
+    if (p->state == RUNNABLE && p->level > top)
+      top = p->level;
+  if (top < 0)
+    return 0;
+  for (int i = 1; i <= NPROC; i++) {
+    struct proc *p = &proc[(last_at[top] + i) % NPROC];
+    if (p->state == RUNNABLE && p->level == top) {
+      last_at[top] = p - proc;
+      return p;
+    }
+  }
+  return 0;
+}
+
 // Choose the next process to run, or return 0 if none is RUNNABLE.
 struct proc *
 policy_pick_next_proc(void)
 {
+  if (mlfq_on)
+    return pick_mlfq();
   switch (sched_current) {
   case SCHED_PRIO:
     return pick_prio();
@@ -162,8 +268,37 @@ policy_dispatch(struct proc *p)
 int
 policy_tick(struct proc *p)
 {
+  if (!mlfq_on) {
+    p->qticks++;
+    return p->qticks >= quantum;
+  }
+
+  // MLFQ, in the order Section 3.5 specifies:
+  // 1. Charge the tick to the allotment and the quantum.
+  p->used++;
   p->qticks++;
-  return p->qticks >= quantum;
+
+  // 2. Rule 5: boost if it is due (may reset p->used and raise p->level).
+  maybe_boost();
+
+  // 3. Rule 4: allotment used up at this level -> move down one queue.
+  //    Q0 has no allotment. Only a queue change resets used; sleeping
+  //    does not (policy_wakeup() leaves it alone).
+  if (p->level > 0 && p->used >= mlfq_allot[p->level]) {
+    set_level(p, p->level - 1);
+    p->used = 0;
+    return 1;
+  }
+  //    Rule 2: quantum of the current level used up. A queue change
+  //    does not restart the quantum; only policy_dispatch() does.
+  if (p->qticks >= mlfq_quantum[p->level])
+    return 1;
+
+  // 4. Rule 1: a RUNNABLE job in a higher queue preempts p at this tick.
+  for (struct proc *q = proc; q < &proc[NPROC]; q++)
+    if (q->state == RUNNABLE && q->level > p->level)
+      return 1;
+  return 0;
 }
 
 // Called when p wakes from sleep (for example, when its simulated I/O
@@ -171,13 +306,28 @@ policy_tick(struct proc *p)
 // a waking process re-enters the policy; for example, a fair-share or
 // stride policy may move a process that slept a long time up to the
 // current minimum, so it cannot claim the CPU for the time it slept.
+// MLFQ: deliberately nothing. The level and the used time carry
+// across sleeps (Rule 4), so a job cannot game its allotment.
 void
 policy_wakeup(struct proc *p)
 {
 }
 
-// Called whenever p's nice value changes.
+// Called whenever p's nice value changes (with p->lock held).
+// MLFQ Rule 6: move p only if its new nice value has a different
+// starting queue. Compare with p->start, not p->level: a job that was
+// demoted and calls nice() with the same starting queue stays put.
 void
 policy_nice(struct proc *p)
 {
+  int ns;
+
+  if (!mlfq_on)
+    return;
+  ns = start_level(p->nice);
+  if (ns == p->start)
+    return;
+  p->start = ns;
+  set_level(p, ns);
+  p->used = 0;
 }
