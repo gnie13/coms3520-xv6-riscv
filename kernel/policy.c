@@ -12,6 +12,8 @@
 // Scheduler IDs added for Project 1C (Feature 7):
 //   3  SCHED_MLFQ  MLFQ, 1C rules (Section 3.5): 3 queues, start queue by nice,
 //                  allotment kept across sleeps, boost every 60 ticks
+//   4  SCHED_STRIDE stride scheduling (Section 3.6): pass in vrt, stride from
+//                  the nice weight, 5-tick slice, wakeup clamp to the min pass
 //   6  SCHED_RR5   round robin with a 5-tick (50 ms) quantum
 //
 // Rules for policy code (Section 2.2 of the project document):
@@ -44,6 +46,7 @@
 #define SCHED_RR1    1 // round robin, 1-tick (10 ms) quantum
 #define SCHED_PRIO   2 // strict priority by nice (Project 1B), 10-tick quantum
 #define SCHED_MLFQ   3 // multi-level feedback queue, 1C rules
+#define SCHED_STRIDE 4 // stride scheduling, 5-tick slice
 #define SCHED_RR5    6 // round robin, 5-tick (50 ms) quantum
 
 // Linux CFS weights for nice -20 .. 19, indexed by nice + 20
@@ -73,6 +76,15 @@ static int boost_interval;             // ticks between priority boosts
 static uint last_boost;                // value of ticks at the last boost
 static int last_at[MLFQ_LEVELS];       // round-robin index per level
 
+// ---- Stride state (ID 4, and later stride tuning variants) ----
+// p->vrt is the pass; the stride is computed from p->nice when needed
+// (stride_of()), so a nice change takes effect at the next tick.
+static int stride_on;       // 1 while a stride policy is selected
+static int stride_slice;    // ticks a process runs before re-picking
+static uint64 stride_base;  // global pass: min pass at the last pick,
+                            // never decreases; the pass for new processes
+static int stride_last;     // index in proc[] of the last process chosen
+
 // Called by set_scheduler(id), and again when a workload starts.
 // Set up global state for policy id. Every call resets all of the
 // policy's global state, so every run starts the same way.
@@ -81,6 +93,7 @@ int
 policy_init(int id)
 {
   mlfq_on = 0;
+  stride_on = 0;
   switch (id) {
   case SCHED_RR:
   case SCHED_PRIO:
@@ -100,6 +113,10 @@ policy_init(int id)
     mlfq_quantum[0] = 15; mlfq_allot[0] = 0; // Q0: no further demotion
     boost_interval = 60;
     break;
+  case SCHED_STRIDE:
+    stride_on = 1;
+    stride_slice = 5; // same as ID 6, so equal-nice results are comparable
+    break;
   default:
     return -1;
   }
@@ -110,6 +127,11 @@ policy_init(int id)
   last_boost = ticks;
   for (int i = 0; i < MLFQ_LEVELS; i++)
     last_at[i] = -1;
+  // Stride: everyone starts level. sched_reset() calls
+  // policy_proc_init() for every process right after this, so every
+  // pass becomes 0.
+  stride_base = 0;
+  stride_last = -1;
   return 0;
 }
 
@@ -149,7 +171,20 @@ policy_proc_init(struct proc *p)
   p->start = start_level(p->nice);
   p->level = p->start;
   p->used = 0;
-  p->vrt = 0;
+  // Stride: a new process starts at the global pass, not 0. fork()
+  // makes the child RUNNABLE without calling policy_wakeup(), and a
+  // reused proc[] slot may hold a dead process's pass, so this is the
+  // only place a forked child gets a fair pass. stride_base is 0
+  // under every other policy and right after policy_init().
+  p->vrt = stride_base;
+}
+
+// Stride: pass added per tick of CPU. (1 << 24) / weight gives 16384
+// at nice 0, 189 at nice -20 and 1118481 at nice 19; never 0.
+static uint64
+stride_of(struct proc *p)
+{
+  return (1 << 24) / nice_weight[p->nice + 20];
 }
 
 // Round robin: the next RUNNABLE process after the last one chosen,
@@ -236,10 +271,34 @@ pick_mlfq(void)
   return 0;
 }
 
+// Stride selection: the RUNNABLE process with the smallest pass.
+// The scan starts after the last process chosen and uses a strict <,
+// so among equal passes the first one after stride_last wins and tied
+// processes take turns instead of the lowest index always winning.
+static struct proc *
+pick_stride(void)
+{
+  struct proc *best = 0;
+
+  for (int i = 1; i <= NPROC; i++) {
+    struct proc *p = &proc[(stride_last + i) % NPROC];
+    if (p->state == RUNNABLE && (best == 0 || p->vrt < best->vrt))
+      best = p;
+  }
+  if (best == 0)
+    return 0;
+  stride_last = best - proc;
+  if (best->vrt > stride_base)
+    stride_base = best->vrt; // the global pass only moves forward
+  return best;
+}
+
 // Choose the next process to run, or return 0 if none is RUNNABLE.
 struct proc *
 policy_pick_next_proc(void)
 {
+  if (stride_on)
+    return pick_stride();
   if (mlfq_on)
     return pick_mlfq();
   switch (sched_current) {
@@ -268,6 +327,14 @@ policy_dispatch(struct proc *p)
 int
 policy_tick(struct proc *p)
 {
+  if (stride_on) {
+    // Charge this tick at p's current weight; re-pick after a slice.
+    // No early preemption when a lower-pass job wakes: it waits for
+    // the end of the current slice (at most stride_slice ticks).
+    p->vrt += stride_of(p);
+    p->qticks++;
+    return p->qticks >= stride_slice;
+  }
   if (!mlfq_on) {
     p->qticks++;
     return p->qticks >= quantum;
@@ -308,15 +375,37 @@ policy_tick(struct proc *p)
 // current minimum, so it cannot claim the CPU for the time it slept.
 // MLFQ: deliberately nothing. The level and the used time carry
 // across sleeps (Rule 4), so a job cannot game its allotment.
+// Stride: pass = max(own pass, min pass of the other RUNNING and
+// RUNNABLE processes). RUNNING counts because wakeup() is often called
+// from the clock interrupt while another process is running; p itself
+// is skipped because wakeup() has already made it RUNNABLE. With no
+// other competitor the pass is kept. A pass never moves backward, so
+// sleeping can neither bank CPU time nor lower a pass.
 void
 policy_wakeup(struct proc *p)
 {
+  int found = 0;
+  uint64 min = 0;
+
+  if (!stride_on)
+    return;
+  for (struct proc *q = proc; q < &proc[NPROC]; q++) {
+    if (q == p || (q->state != RUNNING && q->state != RUNNABLE))
+      continue;
+    if (!found || q->vrt < min)
+      min = q->vrt;
+    found = 1;
+  }
+  if (found && p->vrt < min)
+    p->vrt = min;
 }
 
 // Called whenever p's nice value changes (with p->lock held).
 // MLFQ Rule 6: move p only if its new nice value has a different
 // starting queue. Compare with p->start, not p->level: a job that was
 // demoted and calls nice() with the same starting queue stays put.
+// Stride: deliberately nothing. The pass already charged at the old
+// weight stays; stride_of() uses the new nice from the next tick on.
 void
 policy_nice(struct proc *p)
 {
