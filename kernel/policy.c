@@ -15,6 +15,11 @@
 //   4  SCHED_STRIDE stride scheduling (Section 3.6): pass in vrt, stride from
 //                  the nice weight, 5-tick slice, wakeup clamp to the min pass
 //   6  SCHED_RR5   round robin with a 5-tick (50 ms) quantum
+//  10  SCHED_STRIDE_S1     stride (ID 4) with a 1-tick slice
+//  11  SCHED_STRIDE_WAKE   stride (ID 4) + a waking job with a lower pass
+//                          preempts the running job at that tick
+//  13  SCHED_STRIDE_FLOOR  stride (ID 4) with the weight floored at 1024:
+//                          positive nice no longer shrinks a share below nice 0
 //
 // Rules for policy code (Section 2.2 of the project document):
 //  1. The system has one CPU. These functions run with interrupts off
@@ -48,6 +53,9 @@
 #define SCHED_MLFQ   3 // multi-level feedback queue, 1C rules
 #define SCHED_STRIDE 4 // stride scheduling, 5-tick slice
 #define SCHED_RR5    6 // round robin, 5-tick (50 ms) quantum
+#define SCHED_STRIDE_S1    10 // stride, 1-tick slice (H1)
+#define SCHED_STRIDE_WAKE  11 // stride, preempt on wakeup (H2)
+#define SCHED_STRIDE_FLOOR 13 // stride, weight floor 1024 (H4)
 
 // Linux CFS weights for nice -20 .. 19, indexed by nice + 20
 // (nice 0 has weight 1024). This is the same table user/wl.c uses
@@ -84,6 +92,10 @@ static int stride_slice;    // ticks a process runs before re-picking
 static uint64 stride_base;  // global pass: min pass at the last pick,
                             // never decreases; the pass for new processes
 static int stride_last;     // index in proc[] of the last process chosen
+static int stride_wake_preempt; // 1: a waking job with a lower pass than
+                                // the running job preempts it (ID 11)
+static int need_resched;    // set by policy_wakeup(), used by policy_tick()
+static int stride_min_weight;   // weight floor in stride_of(); 0 = none
 
 // Called by set_scheduler(id), and again when a workload starts.
 // Set up global state for policy id. Every call resets all of the
@@ -94,6 +106,11 @@ policy_init(int id)
 {
   mlfq_on = 0;
   stride_on = 0;
+  // Stride options: off unless a variant's case turns one on, so ID 4
+  // and every non-stride ID behave as before.
+  stride_slice = 5;
+  stride_wake_preempt = 0;
+  stride_min_weight = 0;
   switch (id) {
   case SCHED_RR:
   case SCHED_PRIO:
@@ -117,6 +134,27 @@ policy_init(int id)
     stride_on = 1;
     stride_slice = 5; // same as ID 6, so equal-nice results are comparable
     break;
+  case SCHED_STRIDE_S1:
+    // H1: finer slices for W3's nice 11 granularity and response,
+    // at the cost of a switch on almost every tick.
+    stride_on = 1;
+    stride_slice = 1;
+    break;
+  case SCHED_STRIDE_WAKE:
+    // H2: like MLFQ Rule 1, a waking job does not wait out the rest of
+    // the running job's slice.
+    stride_on = 1;
+    stride_slice = 5;
+    stride_wake_preempt = 1;
+    break;
+  case SCHED_STRIDE_FLOOR:
+    // H4: principle chosen before running: positive nice never lowers
+    // a job's share below nice 0's (weight 1024); negative nice still
+    // raises it. Not tuned to W5's threshold (about 540).
+    stride_on = 1;
+    stride_slice = 5;
+    stride_min_weight = 1024;
+    break;
   default:
     return -1;
   }
@@ -132,6 +170,7 @@ policy_init(int id)
   // pass becomes 0.
   stride_base = 0;
   stride_last = -1;
+  need_resched = 0;
   return 0;
 }
 
@@ -181,10 +220,15 @@ policy_proc_init(struct proc *p)
 
 // Stride: pass added per tick of CPU. (1 << 24) / weight gives 16384
 // at nice 0, 189 at nice -20 and 1118481 at nice 19; never 0.
+// ID 13 floors the weight at stride_min_weight (0 elsewhere: no floor).
 static uint64
 stride_of(struct proc *p)
 {
-  return (1 << 24) / nice_weight[p->nice + 20];
+  int w = nice_weight[p->nice + 20];
+
+  if (w < stride_min_weight)
+    w = stride_min_weight;
+  return (1 << 24) / w;
 }
 
 // Round robin: the next RUNNABLE process after the last one chosen,
@@ -314,6 +358,7 @@ void
 policy_dispatch(struct proc *p)
 {
   p->qticks = 0; // a new quantum starts
+  need_resched = 0; // a new pick was made, so a pending preempt is handled
 }
 
 // Called on every timer tick while p is running.
@@ -329,10 +374,16 @@ policy_tick(struct proc *p)
 {
   if (stride_on) {
     // Charge this tick at p's current weight; re-pick after a slice.
-    // No early preemption when a lower-pass job wakes: it waits for
-    // the end of the current slice (at most stride_slice ticks).
+    // Without stride_wake_preempt, a lower-pass job that wakes waits
+    // for the end of the current slice (at most stride_slice ticks).
     p->vrt += stride_of(p);
     p->qticks++;
+    // ID 11: a job woke this tick with a lower pass (clockintr() runs
+    // wakeup() before timer_tick() calls this).
+    if (need_resched) {
+      need_resched = 0;
+      return 1;
+    }
     return p->qticks >= stride_slice;
   }
   if (!mlfq_on) {
@@ -398,6 +449,15 @@ policy_wakeup(struct proc *p)
   }
   if (found && p->vrt < min)
     p->vrt = min;
+
+  // ID 11: preempt the running job if the waking job's pass (after the
+  // clamp) is strictly lower. Strict, so a tie does not cut a slice.
+  // Found by state, without p->lock (policy-code rule 1).
+  if (stride_wake_preempt) {
+    for (struct proc *q = proc; q < &proc[NPROC]; q++)
+      if (q != p && q->state == RUNNING && p->vrt < q->vrt)
+        need_resched = 1;
+  }
 }
 
 // Called whenever p's nice value changes (with p->lock held).
